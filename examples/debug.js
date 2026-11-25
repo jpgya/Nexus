@@ -65,14 +65,14 @@ $("accept-offer").addEventListener("click", () => run(async () => {
   if (!transport) throw new Error("先にこのタブを初期化してください");
   const id = peerId();
   node.addPeer(id);
-  $("answer").value = await transport.acceptOffer(id, $("offer").value.trim());
+  $("answer").value = await transport.acceptOffer(id, $("offer").value);
   setStatus("Answer作成済み。Offer側へコピーしてください");
   log("Offerを受け入れ、Answerを作成しました", { peerId: id });
 }));
 
 $("apply-answer").addEventListener("click", () => run(async () => {
   if (!transport) throw new Error("先にこのタブを初期化してください");
-  await transport.acceptAnswer(peerId(), $("answer").value.trim());
+  await transport.acceptAnswer(peerId(), $("answer").value);
   setStatus("Answerを適用しました。ICE接続を待っています");
   log("Answerを適用しました", { peerId: peerId() });
 }));

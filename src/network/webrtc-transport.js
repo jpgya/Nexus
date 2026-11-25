@@ -88,16 +88,21 @@ export class WebRtcTransport extends Transport {
 
   async createOffer(peerId) {
     const peer = this.#createPeer(peerId);
-    peer.channel = peer.connection.createDataChannel(this.dataChannelLabel, { ordered: true });
-    this.#bindChannel(peer, peer.channel);
-    const offer = await peer.connection.createOffer();
-    await peer.connection.setLocalDescription(offer);
-    await waitForIceGathering(peer.connection, this.iceGatheringTimeoutMs);
-    return peer.connection.localDescription.sdp;
+    try {
+      peer.channel = peer.connection.createDataChannel(this.dataChannelLabel, { ordered: true });
+      this.#bindChannel(peer, peer.channel);
+      const offer = await peer.connection.createOffer();
+      await peer.connection.setLocalDescription(offer);
+      await waitForIceGathering(peer.connection, this.iceGatheringTimeoutMs);
+      return peer.connection.localDescription.sdp;
+    } catch (error) {
+      this.closePeer(peerId);
+      throw error;
+    }
   }
 
   async acceptOffer(peerId, offerSdp) {
-    if (typeof offerSdp !== "string" || offerSdp.length === 0) {
+    if (typeof offerSdp !== "string" || offerSdp.trim().length === 0) {
       throw new TypeError("offerSdp must be a non-empty SDP string");
     }
     const peer = this.#createPeer(peerId);
@@ -105,19 +110,29 @@ export class WebRtcTransport extends Transport {
       peer.channel = event.channel;
       this.#bindChannel(peer, peer.channel);
     });
-    await peer.connection.setRemoteDescription({ type: "offer", sdp: offerSdp });
-    const answer = await peer.connection.createAnswer();
-    await peer.connection.setLocalDescription(answer);
-    await waitForIceGathering(peer.connection, this.iceGatheringTimeoutMs);
-    return peer.connection.localDescription.sdp;
+    try {
+      await peer.connection.setRemoteDescription({ type: "offer", sdp: offerSdp });
+      const answer = await peer.connection.createAnswer();
+      await peer.connection.setLocalDescription(answer);
+      await waitForIceGathering(peer.connection, this.iceGatheringTimeoutMs);
+      return peer.connection.localDescription.sdp;
+    } catch (error) {
+      this.closePeer(peerId);
+      throw error;
+    }
   }
 
   async acceptAnswer(peerId, answerSdp) {
     const peer = this.#peer(peerId);
-    if (typeof answerSdp !== "string" || answerSdp.length === 0) {
+    if (typeof answerSdp !== "string" || answerSdp.trim().length === 0) {
       throw new TypeError("answerSdp must be a non-empty SDP string");
     }
-    await peer.connection.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    try {
+      await peer.connection.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    } catch (error) {
+      this.closePeer(peerId);
+      throw error;
+    }
   }
 
   async send(peerId, message) {

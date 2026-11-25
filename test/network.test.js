@@ -112,6 +112,7 @@ test("WebRtcTransport validates browser capability and message limits", () => {
 test("WebRtcTransport supports manual offer-answer signaling through RTC adapter", async () => {
   class MockPeerConnection {
     constructor() {
+      MockPeerConnection.instances.push(this);
       this.iceGatheringState = "complete";
       this.connectionState = "new";
       this.iceConnectionState = "new";
@@ -138,21 +139,57 @@ test("WebRtcTransport supports manual offer-answer signaling through RTC adapter
       return this.channel;
     }
 
-    async createOffer() { return { type: "offer", sdp: "test-offer" }; }
-    async createAnswer() { return { type: "answer", sdp: "test-answer" }; }
+    async createOffer() { return { type: "offer", sdp: "test-offer\n" }; }
+    async createAnswer() { return { type: "answer", sdp: "test-answer\n" }; }
     async setLocalDescription(description) { this.localDescription = description; }
     async setRemoteDescription(description) { this.remoteDescription = description; }
     close() { this.connectionState = "closed"; }
   }
+  MockPeerConnection.instances = [];
 
   const offerSide = new WebRtcTransport({ RTCPeerConnection: MockPeerConnection });
   const answerSide = new WebRtcTransport({ RTCPeerConnection: MockPeerConnection });
   const offer = await offerSide.createOffer("answer");
-  assert.equal(offer, "test-offer");
+  assert.equal(offer, "test-offer\n");
   const answer = await answerSide.acceptOffer("offer", offer);
-  assert.equal(answer, "test-answer");
+  assert.equal(answer, "test-answer\n");
+  assert.equal(MockPeerConnection.instances[1].remoteDescription.sdp, offer);
   await offerSide.acceptAnswer("answer", answer);
+  assert.equal(MockPeerConnection.instances[0].remoteDescription.sdp, answer);
   assert.equal(offerSide.getPeers()[0].connectionState, "new");
   offerSide.close();
   answerSide.close();
+});
+
+test("WebRtcTransport closes incomplete peer connections after signaling errors", async () => {
+  class FailingPeerConnection {
+    constructor() {
+      this.iceGatheringState = "complete";
+      this.connectionState = "new";
+      this.iceConnectionState = "new";
+      this.listeners = new Map();
+    }
+
+    addEventListener(type, handler) {
+      const handlers = this.listeners.get(type) ?? new Set();
+      handlers.add(handler);
+      this.listeners.set(type, handlers);
+    }
+
+    removeEventListener(type, handler) {
+      this.listeners.get(type)?.delete(handler);
+    }
+
+    createDataChannel() {
+      return { addEventListener() {}, close() {} };
+    }
+
+    async createOffer() { throw new Error("signaling failed"); }
+    close() { this.connectionState = "closed"; }
+  }
+
+  const transport = new WebRtcTransport({ RTCPeerConnection: FailingPeerConnection });
+  await assert.rejects(transport.createOffer("peer-b"), /signaling failed/);
+  assert.deepEqual(transport.getPeers(), []);
+  transport.close();
 });
