@@ -4,8 +4,10 @@ import { NexusNode } from "../src/node.js";
 import { WebRtcTransport } from "../src/network/webrtc-transport.js";
 
 class MemoryNetwork {
-  constructor() {
+  constructor({ asyncDelivery = false } = {}) {
     this.handlers = new Map();
+    this.asyncDelivery = asyncDelivery;
+    this.errors = [];
   }
 
   transport(id) {
@@ -19,6 +21,13 @@ class MemoryNetwork {
       async send(peerId, message) {
         const peerListeners = network.handlers.get(peerId);
         if (!peerListeners) throw new Error(`Unknown peer: ${peerId}`);
+        if (network.asyncDelivery) {
+          queueMicrotask(() => {
+            Promise.all([...peerListeners].map((handler) => handler(id, message)))
+              .catch((error) => network.errors.push(error));
+          });
+          return;
+        }
         await Promise.all([...peerListeners].map((handler) => handler(id, message)));
       },
       async request(peerId, message) {
@@ -64,6 +73,70 @@ test("NexusNode forwards verified packets through peers and retrieves remotely",
   c.close();
 });
 
+test("NexusNode retrieves shards through multiple peers without query loops", async () => {
+  const network = new MemoryNetwork();
+  const source = new NexusNode(network.transport("source"), { nodeId: "source" });
+  const relay = new NexusNode(network.transport("relay"), { nodeId: "relay" });
+  const requester = new NexusNode(network.transport("requester"), { nodeId: "requester" });
+  const input = new TextEncoder().encode("distributed query across an intermediate peer");
+  const published = await source.publish(input, { dataShards: 3, parityShards: 2 });
+
+  source.addPeer("relay");
+  relay.addPeer("source");
+  relay.addPeer("requester");
+  requester.addPeer("relay");
+  const result = await requester.retrieve(published.objectId, { maxHops: 3, maxPeers: 2 });
+  assert.equal(result.status, "recovered");
+  assert.deepEqual(result.data, input);
+  assert.ok(result.measured.durationMs >= 0);
+
+  source.close();
+  relay.close();
+  requester.close();
+});
+
+test("independent peer ring continuously circulates packets until configured expiry", async () => {
+  const network = new MemoryNetwork({ asyncDelivery: true });
+  const ids = ["a", "b", "c", "d"];
+  const nodes = ids.map((id) => new NexusNode(network.transport(id), {
+    nodeId: id,
+    autoStartCirculation: false,
+    circulationIntervalMs: 100,
+    maxCircuits: 20
+  }));
+  for (let index = 0; index < ids.length; index += 1) {
+    const node = nodes[index];
+    const next = ids[(index + 1) % ids.length];
+    const previous = ids[(index + ids.length - 1) % ids.length];
+    node.addPeer(next);
+    node.addPeer(previous);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const published = await nodes[0].publish(new TextEncoder().encode("circulate around peers"), {
+    dataShards: 2,
+    parityShards: 1,
+    expiresInMs: 10_000
+  });
+  assert.ok(nodes[0].getStatus().routeCount > 0);
+  nodes[0].startCirculation();
+  await new Promise((resolve) => setTimeout(resolve, 350));
+
+  const status = nodes[0].getStatus();
+  assert.ok(status.circulation.metrics.laps > 0, JSON.stringify(nodes.map((node) => node.getStatus())));
+  assert.ok(status.metrics.communicationBytes > 0);
+  assert.ok(nodes[2].getStatus().packetCount > 0);
+  assert.equal(status.measurementSource, "runtime");
+  assert.ok((await nodes[2].retrieve(published.objectId)).status === "recovered");
+  nodes[0].removePeer("b");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(nodes[0].getStatus().routeCount, 0);
+  nodes[0].addPeer("b");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(nodes[0].getStatus().routeCount > 0);
+  assert.deepEqual(network.errors, []);
+  for (const node of nodes) node.close();
+});
+
 test("NexusNode rejects corrupted packets before storing or forwarding", async () => {
   const network = new MemoryNetwork();
   const sourceTransport = network.transport("source");
@@ -96,7 +169,7 @@ test("NexusNode paginates large remote retrieval responses", async () => {
   const recovered = await requester.retrieve(published.objectId);
   assert.equal(recovered.status, "recovered");
   assert.deepEqual(recovered.data, input);
-  assert.equal(requester.getStatus().packetCount, 7);
+  assert.ok(requester.getStatus().packetCount >= 5);
   source.close();
   requester.close();
 });

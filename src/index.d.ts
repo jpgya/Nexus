@@ -36,6 +36,7 @@ export type RetrievalResult =
       packetsFound: number;
       packetsNeeded: number;
       reachable: boolean;
+      measured?: { durationMs: number; retrievalSuccessRate: number; averageRetrievalMs: number };
       peerErrors?: string[];
     }
   | {
@@ -43,6 +44,7 @@ export type RetrievalResult =
       packetsFound: number;
       packetsNeeded: number | null;
       reachable?: boolean;
+      measured?: { durationMs: number; retrievalSuccessRate: number; averageRetrievalMs: number };
       reason?: string;
       peerErrors?: string[];
     };
@@ -73,6 +75,107 @@ export class Transport {
   send(peerId: string, message: unknown): Promise<void>;
   request(peerId: string, message: unknown, options?: unknown): Promise<unknown>;
   subscribe(handler: (peerId: string, message: unknown) => void): () => void;
+  subscribeStatus?(handler: (peers: WebRtcPeerStatus[]) => void): () => void;
+  close(): void;
+}
+
+export class TransferController {
+  constructor(transport: Transport, options?: {
+    maxMessageBytes?: number;
+    maxQueuedBytesPerPeer?: number;
+    maxRetries?: number;
+    retryDelayMs?: number;
+  });
+  send(peerId: string, message: unknown): Promise<number>;
+  getStatus(): {
+    metrics: { sentBytes: number; sentMessages: number; failedMessages: number; retries: number };
+    queuedBytes: Record<string, number>;
+  };
+}
+
+export interface DiscoveredPeer {
+  peerId: string;
+  [key: string]: unknown;
+}
+
+export class PeerDiscovery {
+  start(onPeer: (peer: string | DiscoveredPeer) => void): Promise<unknown> | unknown;
+  stop(): Promise<void> | void;
+}
+
+export class ManualPeerDiscovery extends PeerDiscovery {
+  announce(peer: string | DiscoveredPeer): void;
+}
+
+export class ApplicationPeerDiscovery extends PeerDiscovery {
+  constructor(provider: PeerDiscovery);
+}
+
+export class LanPeerDiscovery extends ApplicationPeerDiscovery {
+  constructor(adapter: PeerDiscovery);
+}
+
+export interface HybridRoute {
+  id: string;
+  generation: string;
+  nodes: string[];
+  edges: string[];
+}
+
+export class HybridRouteManager {
+  constructor(options?: { maxRoutes?: number; maxRouteLength?: number; minRouteLength?: number });
+  readonly generation: number;
+  readonly topologyId: string;
+  setTopology(topology: Map<string, Set<string> | string[]>): number;
+  addLink(left: string, right: string): boolean;
+  removeLink(left: string, right: string): boolean;
+  getRouteId(nodes: string[], topologyId?: string): string;
+  isValidRoute(nodes: string[], topologyId?: string, routeId?: string): boolean;
+  getRoutes(localNodeId: string, options?: { maxRoutes?: number }): HybridRoute[];
+  getTopology(): Map<string, Set<string>>;
+}
+
+export class DuplicateTracker {
+  constructor(options?: { maxEntries?: number; now?: () => number });
+  readonly size: number;
+  readonly duplicates: number;
+  has(packetId: string): boolean;
+  mark(packetId: string, expiresAt?: number): boolean;
+  clear(): void;
+}
+
+export class CirculationEngine {
+  constructor(options: {
+    nodeId: string;
+    routeManager: HybridRouteManager;
+    send(peerId: string, message: unknown): Promise<number | void>;
+    intervalMs?: number;
+    maxCircuits?: number;
+    maxRelayHops?: number;
+    now?: () => number;
+    onMetric?: (event: unknown) => void;
+  });
+  start(): boolean;
+  stop(): boolean;
+  register(packet: Packet): boolean;
+  receive(peerId: string, envelope: unknown): Promise<boolean>;
+  tick(): Promise<void>;
+  isStalled(thresholdMs?: number): boolean;
+  getStatus(): {
+    running: boolean;
+    circulatingPackets: number;
+    routeCount: number;
+    lastProgressAt: number | null;
+    stalled: boolean;
+    metrics: {
+      laps: number;
+      forwarded: number;
+      bytes: number;
+      startedAt: number | null;
+      lastProgressAt: number | null;
+      stoppedRoutes: number;
+    };
+  };
   close(): void;
 }
 
@@ -90,6 +193,7 @@ export class WebRtcTransport extends Transport {
     maxMessageBytes?: number;
     requestTimeoutMs?: number;
     iceGatheringTimeoutMs?: number;
+    disconnectGraceMs?: number;
     dataChannelLabel?: string;
   });
   createOffer(peerId: string): Promise<string>;
@@ -107,10 +211,23 @@ export class NexusNode {
   constructor(transport: Transport, options?: {
     nodeId?: string;
     maxPackets?: number;
+    maxMemoryBytes?: number;
     maxPacketBytes?: number;
+    maxPeers?: number;
+    maxTopologyNodes?: number;
     maxRetrievePackets?: number;
     maxRetrieveBytes?: number;
     maxRelayHops?: number;
+    maxRoutes?: number;
+    maxSearchHops?: number;
+    maxSearchPeers?: number;
+    circulationIntervalMs?: number;
+    maxCircuits?: number;
+    maxQueuedBytesPerPeer?: number;
+    maxMessageBytes?: number;
+    maxRetries?: number;
+    autoStartCirculation?: boolean;
+    discovery?: PeerDiscovery;
     authenticator?: PacketAuthenticator;
   });
   readonly nodeId: string;
@@ -120,17 +237,41 @@ export class NexusNode {
   }>;
   retrieve(
     objectId: string,
-    options?: { timeoutMs?: number; authenticator?: PacketAuthenticator; now?: number }
+    options?: {
+      timeoutMs?: number;
+      authenticator?: PacketAuthenticator;
+      now?: number;
+      maxHops?: number;
+      maxPeers?: number;
+    }
   ): Promise<RetrievalResult>;
   addPeer(peerId: string): void;
   removePeer(peerId: string): void;
   syncPeer(peerId: string): Promise<{ packetsSent: number }>;
+  startCirculation(): boolean;
+  stopCirculation(): boolean;
+  startDiscovery(onPeerDiscovered?: (peer: string | DiscoveredPeer) => void): Promise<unknown>;
+  stopDiscovery(): Promise<void>;
   subscribe(listener: (packet: Packet) => void): () => void;
   getStatus(): {
     nodeId: string;
     peers: string[];
+    peerCount: number;
+    configuredPeerCount: number;
+    discoveredPeerCount: number;
     packetCount: number;
-    metrics: { accepted: number; rejected: number; relayed: number; retrievals: number };
+    packetBytes: number;
+    payloadMemory: {
+      retainedPayloadBytes: number;
+      totalHeapBytes: null;
+      note: string;
+    };
+    routes: HybridRoute[];
+    routeCount: number;
+    circulation: ReturnType<CirculationEngine["getStatus"]>;
+    transfer: ReturnType<TransferController["getStatus"]>;
+    measurementSource: "runtime";
+    metrics: Record<string, number | boolean>;
   };
   close(): void;
 }
@@ -138,6 +279,7 @@ export class NexusNode {
 export class NetworkSimulator {
   constructor(options?: {
     maxPacketsPerNode?: number;
+    maxMemoryBytesPerNode?: number;
     random?: () => number;
   });
   addNode(id: string): void;
@@ -160,9 +302,11 @@ export class NetworkSimulator {
     options?: { fromNodeId?: string; authenticator?: PacketAuthenticator; now?: number }
   ): Promise<RetrievalResult>;
   getStatus(): {
-    nodes: Array<{ id: string; online: boolean; packetCount: number }>;
+    nodes: Array<{ id: string; online: boolean; packetCount: number; packetBytes: number }>;
     routes: Array<{ id: string; nodes: string[] }>;
     routeEpoch: number;
-    metrics: { forwarded: number; dropped: number; duplicates: number; retrievals: number };
+    metrics: Record<string, number>;
+    measurementSource: "simulation";
+    memoryBytes: number;
   };
 }

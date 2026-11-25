@@ -60,6 +60,7 @@ export class WebRtcTransport extends Transport {
     maxMessageBytes = 1_000_000,
     requestTimeoutMs = 10_000,
     iceGatheringTimeoutMs = 30_000,
+    disconnectGraceMs = 5_000,
     dataChannelLabel = "nexus"
   } = {}) {
     super();
@@ -70,7 +71,8 @@ export class WebRtcTransport extends Transport {
       throw new RangeError("maxMessageBytes must be a positive integer");
     }
     if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0
-      || !Number.isFinite(iceGatheringTimeoutMs) || iceGatheringTimeoutMs <= 0) {
+      || !Number.isFinite(iceGatheringTimeoutMs) || iceGatheringTimeoutMs <= 0
+      || !Number.isFinite(disconnectGraceMs) || disconnectGraceMs < 0) {
       throw new RangeError("Timeouts must be positive finite numbers");
     }
     this.PeerConnection = PeerConnection;
@@ -78,9 +80,11 @@ export class WebRtcTransport extends Transport {
     this.maxMessageBytes = maxMessageBytes;
     this.requestTimeoutMs = requestTimeoutMs;
     this.iceGatheringTimeoutMs = iceGatheringTimeoutMs;
+    this.disconnectGraceMs = disconnectGraceMs;
     this.dataChannelLabel = dataChannelLabel;
     this.peers = new Map();
     this.handlers = new Set();
+    this.statusHandlers = new Set();
     this.pendingRequests = new Map();
     this.nextRequestId = 0;
     this.closed = false;
@@ -170,6 +174,13 @@ export class WebRtcTransport extends Transport {
     return () => this.handlers.delete(handler);
   }
 
+  subscribeStatus(handler) {
+    if (typeof handler !== "function") throw new TypeError("handler must be a function");
+    this.statusHandlers.add(handler);
+    handler(this.getPeers());
+    return () => this.statusHandlers.delete(handler);
+  }
+
   getPeers() {
     return [...this.peers.values()].map(({ id, connection, channel }) => ({
       id,
@@ -184,6 +195,7 @@ export class WebRtcTransport extends Transport {
     if (!peer) return;
     peer.channel?.close();
     peer.connection.close();
+    clearTimeout(peer.disconnectTimer);
     this.peers.delete(peerId);
     for (const [id, request] of this.pendingRequests) {
       if (request.peerId === peerId) {
@@ -192,6 +204,7 @@ export class WebRtcTransport extends Transport {
         request.reject(new Error(`Peer "${peerId}" disconnected`));
       }
     }
+    this.#notifyStatus();
   }
 
   close() {
@@ -204,6 +217,7 @@ export class WebRtcTransport extends Transport {
       request.reject(new Error("Transport closed"));
     }
     this.handlers.clear();
+    this.statusHandlers.clear();
   }
 
   #createPeer(peerId) {
@@ -213,18 +227,23 @@ export class WebRtcTransport extends Transport {
     }
     if (this.peers.has(peerId)) throw new Error(`Peer already exists: ${peerId}`);
     const connection = new this.PeerConnection(this.rtcConfiguration);
-    const peer = { id: peerId, connection, channel: null };
+    const peer = { id: peerId, connection, channel: null, disconnectTimer: null };
     this.peers.set(peerId, peer);
     connection.addEventListener("connectionstatechange", () => {
+      this.#handlePeerConnectionState(peer);
+      this.#notifyStatus();
       if (connection.connectionState === "failed" || connection.connectionState === "closed") {
         this.closePeer(peerId);
       }
     });
     connection.addEventListener("iceconnectionstatechange", () => {
+      this.#handlePeerConnectionState(peer, connection.iceConnectionState);
+      this.#notifyStatus();
       if (connection.iceConnectionState === "failed" || connection.iceConnectionState === "closed") {
         this.closePeer(peerId);
       }
     });
+    this.#notifyStatus();
     return peer;
   }
 
@@ -246,7 +265,10 @@ export class WebRtcTransport extends Transport {
     });
     channel.addEventListener("close", () => {
       if (peer.channel === channel) peer.channel = null;
+      this.#notifyStatus();
     });
+    channel.addEventListener("open", () => this.#notifyStatus());
+    this.#notifyStatus();
   }
 
   async #sendFrame(peer, frame) {
@@ -255,10 +277,60 @@ export class WebRtcTransport extends Transport {
     if (!channel || channel.readyState !== "open") {
       throw new Error(`Data channel to peer "${peer.id}" is not open`);
     }
-    if (channel.bufferedAmount > 4 * this.maxMessageBytes) {
-      throw new Error(`Data channel to peer "${peer.id}" is congested`);
+    const highWaterMark = 4 * this.maxMessageBytes;
+    if (channel.bufferedAmount > highWaterMark) {
+      await this.#waitForBuffer(peer, channel, highWaterMark / 2);
     }
+    if (channel.readyState !== "open") throw new Error(`Data channel to peer "${peer.id}" is not open`);
     channel.send(frame);
+  }
+
+  async #waitForBuffer(peer, channel, lowWaterMark) {
+    channel.bufferedAmountLowThreshold = lowWaterMark;
+    if (channel.bufferedAmount <= lowWaterMark) return;
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Data channel to peer "${peer.id}" remained congested`));
+      }, this.requestTimeoutMs);
+      const onLow = () => {
+        cleanup();
+        resolve();
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error(`Data channel to peer "${peer.id}" closed while congested`));
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        channel.removeEventListener("bufferedamountlow", onLow);
+        channel.removeEventListener("close", onClose);
+      };
+      channel.addEventListener("bufferedamountlow", onLow, { once: true });
+      channel.addEventListener("close", onClose, { once: true });
+      if (channel.bufferedAmount <= lowWaterMark) onLow();
+    });
+  }
+
+  #notifyStatus() {
+    const status = this.getPeers();
+    for (const handler of this.statusHandlers) handler(status);
+  }
+
+  #handlePeerConnectionState(peer) {
+    const disconnected = peer.connection.connectionState === "disconnected"
+      || peer.connection.iceConnectionState === "disconnected";
+    if (!disconnected) {
+      clearTimeout(peer.disconnectTimer);
+      peer.disconnectTimer = null;
+      return;
+    }
+    if (peer.disconnectTimer) return;
+    peer.disconnectTimer = setTimeout(() => {
+      peer.disconnectTimer = null;
+      if (peer.connection.connectionState === "disconnected"
+        || peer.connection.iceConnectionState === "disconnected") this.closePeer(peer.id);
+    }, this.disconnectGraceMs);
   }
 
   async #receiveFrame(peerId, data) {

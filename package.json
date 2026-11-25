@@ -1,6 +1,6 @@
 {
   "name": "@nexus/circulation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A serverless, transport-agnostic library for simulating and building resilient packet circulation networks.",
   "type": "module",
   "main": "./src/index.js",
@@ -13,7 +13,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/simulator.js && node --check src/node.js && node --check src/network/webrtc-transport.js && node --check examples/debug.js"
+    "check": "node --check src/index.js && node --check src/simulator.js && node --check src/node.js && node --check src/routing/route-manager.js && node --check src/circulation/circulation-engine.js && node --check src/circulation/duplicate-tracker.js && node --check src/network/transfer-controller.js && node --check src/network/peer-discovery.js && node --check src/network/webrtc-transport.js && node --check examples/debug.js",
+    "debug:lan": "python3 -m http.server 8765 --bind 0.0.0.0"
   },
   "engines": {
     "node": ">=20"

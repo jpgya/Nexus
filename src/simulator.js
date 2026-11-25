@@ -1,24 +1,41 @@
 import { createPackets } from "./packet.js";
 import { retrieveObject } from "./retrieval.js";
+import { HybridRouteManager } from "./routing/route-manager.js";
 
 export class NetworkSimulator {
-  constructor({ maxPacketsPerNode = 10_000, random = Math.random } = {}) {
-    if (!Number.isInteger(maxPacketsPerNode) || maxPacketsPerNode < 1) {
-      throw new RangeError("maxPacketsPerNode must be a positive integer");
+  constructor({
+    maxPacketsPerNode = 10_000,
+    maxMemoryBytesPerNode = 128 * 1024 * 1024,
+    random = Math.random
+  } = {}) {
+    if (!Number.isInteger(maxPacketsPerNode) || maxPacketsPerNode < 1
+      || !Number.isInteger(maxMemoryBytesPerNode) || maxMemoryBytesPerNode < 1) {
+      throw new RangeError("Node packet and memory limits must be positive integers");
     }
     this.maxPacketsPerNode = maxPacketsPerNode;
+    this.maxMemoryBytesPerNode = maxMemoryBytesPerNode;
     this.random = random;
     this.nodes = new Map();
+    this.routeManager = new HybridRouteManager({ maxRoutes: 2, minRouteLength: 2 });
     this.partitions = null;
     this.routes = [];
     this.routeEpoch = 0;
-    this.metrics = { forwarded: 0, dropped: 0, duplicates: 0, retrievals: 0 };
+    this.metrics = {
+      forwarded: 0,
+      dropped: 0,
+      duplicates: 0,
+      retrievals: 0,
+      retrievalSuccesses: 0,
+      retrievalDurationMs: 0,
+      routeReconfigurations: 0,
+      communicationBytes: 0
+    };
   }
 
   addNode(id) {
     if (typeof id !== "string" || id.length === 0) throw new TypeError("Node id is required");
     if (this.nodes.has(id)) throw new Error(`Node already exists: ${id}`);
-    this.nodes.set(id, { id, online: true, packets: new Map() });
+    this.nodes.set(id, { id, online: true, packets: new Map(), packetBytes: 0 });
     this.reconfigureRoutes();
   }
 
@@ -48,6 +65,7 @@ export class NetworkSimulator {
 
   reconfigureRoutes() {
     this.routeEpoch += 1;
+    this.metrics.routeReconfigurations += 1;
     const groups = new Map();
     for (const node of this.nodes.values()) {
       if (!node.online) continue;
@@ -57,9 +75,20 @@ export class NetworkSimulator {
       members.push(node.id);
       groups.set(group, members);
     }
-    this.routes = [...groups.values()]
-      .filter((members) => members.length >= 2)
-      .map((nodes, index) => ({ id: `route-${this.routeEpoch}-${index}`, nodes }));
+    const topology = new Map();
+    for (const members of groups.values()) {
+      for (const nodeId of members) {
+        topology.set(nodeId, new Set(members.filter((peerId) => peerId !== nodeId)));
+      }
+    }
+    this.routeManager.setTopology(topology);
+    const routes = [];
+    for (const members of groups.values()) {
+      if (members.length < 2) continue;
+      const route = this.routeManager.getRoutes(members[0], { maxRoutes: 1 })[0];
+      if (route) routes.push({ id: `route-${this.routeEpoch}-${routes.length}`, nodes: route.nodes });
+    }
+    this.routes = routes;
     return this.routes.map((route) => ({ id: route.id, nodes: [...route.nodes] }));
   }
 
@@ -94,8 +123,10 @@ export class NetworkSimulator {
         for (const packet of source.packets.values()) {
           if (packet.expiresAt <= Date.now()) {
             source.packets.delete(packet.packetId);
+            source.packetBytes -= packet.payload.byteLength;
             continue;
           }
+          this.metrics.communicationBytes += packet.payload.byteLength;
           if (this.random() < lossRate) {
             dropped += 1;
             continue;
@@ -103,8 +134,11 @@ export class NetworkSimulator {
           const wasPresent = destination.packets.has(packet.packetId);
           this.#store(destination, packet);
           if (wasPresent) duplicates += 1;
-          else forwarded += 1;
+          else {
+            forwarded += 1;
+          }
           if (this.random() < duplicateRate) {
+            this.metrics.communicationBytes += packet.payload.byteLength;
             if (destination.packets.has(packet.packetId)) duplicates += 1;
             else this.#store(destination, packet);
           }
@@ -118,6 +152,7 @@ export class NetworkSimulator {
   }
 
   async retrieve(objectId, { fromNodeId, authenticator, now } = {}) {
+    const startedAt = Date.now();
     this.metrics.retrievals += 1;
     let visibleNodes = [...this.nodes.values()].filter((node) => node.online);
     if (fromNodeId !== undefined) {
@@ -129,21 +164,43 @@ export class NetworkSimulator {
       }
     }
     const packets = visibleNodes.flatMap((node) => [...node.packets.values()]);
-    return retrieveObject(objectId, packets, {
+    const result = await retrieveObject(objectId, packets, {
       reachable: visibleNodes.length > 0,
       authenticator,
       now
     });
+    this.metrics.retrievalDurationMs += Date.now() - startedAt;
+    if (result.status === "recovered") this.metrics.retrievalSuccesses += 1;
+    return {
+      ...result,
+      measured: {
+        durationMs: Date.now() - startedAt,
+        retrievalSuccessRate: this.metrics.retrievalSuccesses / this.metrics.retrievals,
+        averageRetrievalMs: this.metrics.retrievalDurationMs / this.metrics.retrievals
+      }
+    };
   }
 
   getStatus() {
     return {
-      nodes: [...this.nodes.values()].map(({ id, online, packets }) => ({
-        id, online, packetCount: packets.size
+      nodes: [...this.nodes.values()].map(({ id, online, packets, packetBytes }) => ({
+        id, online, packetCount: packets.size, packetBytes
       })),
       routes: this.routes.map(({ id, nodes }) => ({ id, nodes: [...nodes] })),
       routeEpoch: this.routeEpoch,
-      metrics: { ...this.metrics }
+      metrics: {
+        ...this.metrics,
+        peerCount: [...this.nodes.values()].filter((node) => node.online).length,
+        routeCount: this.routes.length,
+        retrievalSuccessRate: this.metrics.retrievals === 0 ? 0
+          : this.metrics.retrievalSuccesses / this.metrics.retrievals,
+        averageRetrievalMs: this.metrics.retrievals === 0 ? 0
+          : this.metrics.retrievalDurationMs / this.metrics.retrievals,
+        circulatingPackets: [...this.nodes.values()].reduce(
+          (total, node) => total + node.packets.size, 0)
+      },
+      measurementSource: "simulation",
+      memoryBytes: [...this.nodes.values()].reduce((total, node) => total + node.packetBytes, 0)
     };
   }
 
@@ -156,8 +213,16 @@ export class NetworkSimulator {
   #store(node, packet) {
     if (!node || !node.online) return false;
     if (node.packets.has(packet.packetId)) return false;
-    if (node.packets.size >= this.maxPacketsPerNode) return false;
+    if (packet.payload.byteLength > this.maxMemoryBytesPerNode) return false;
+    while (node.packets.size >= this.maxPacketsPerNode
+      || node.packetBytes + packet.payload.byteLength > this.maxMemoryBytesPerNode) {
+      const oldest = node.packets.keys().next().value;
+      if (oldest === undefined) return false;
+      node.packetBytes -= node.packets.get(oldest).payload.byteLength;
+      node.packets.delete(oldest);
+    }
     node.packets.set(packet.packetId, packet);
+    node.packetBytes += packet.payload.byteLength;
     return true;
   }
 
