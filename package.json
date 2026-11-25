@@ -1,0 +1,22 @@
+{
+  "name": "@nexus/circulation",
+  "version": "0.1.0",
+  "description": "A serverless, transport-agnostic library for simulating and building resilient packet circulation networks.",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/simulator.js && node --check src/node.js && node --check src/network/webrtc-transport.js && node --check examples/debug.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NEXUS WebRTC Debug</title>
+    <style>
+      :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #10151b; color: #e7edf4; }
+      body { max-width: 1000px; margin: 0 auto; padding: 28px 18px 64px; }
+      h1, h2 { line-height: 1.2; }
+      h1 { margin-bottom: 4px; }
+      p, small { color: #a8b6c5; }
+      section { margin: 18px 0; padding: 18px; border: 1px solid #2a3948; border-radius: 10px; background: #171f28; }
+      label { display: block; margin: 12px 0 5px; font-weight: 600; }
+      input, textarea, button { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #3b5064; border-radius: 6px; background: #0e151d; color: inherit; font: inherit; }
+      textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, monospace; font-size: 13px; }
+      button { width: auto; margin: 8px 8px 0 0; background: #155e75; cursor: pointer; }
+      button:hover { background: #0e7490; }
+      pre { min-height: 150px; max-height: 360px; overflow: auto; padding: 12px; border-radius: 6px; background: #0b1016; white-space: pre-wrap; overflow-wrap: anywhere; }
+      code { color: #9ce5c0; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+      .status { font-family: ui-monospace, monospace; color: #9ce5c0; }
+    </style>
+  </head>
+  <body>
+    <h1>NEXUS WebRTC Debug</h1>
+    <p>2つのブラウザータブでこのページを開き、SDPを手動交換して直接接続します。シグナリングサーバーは使用しません。</p>
+    <section>
+      <h2>1. ピア設定</h2>
+      <div class="grid">
+        <div>
+          <label for="local-id">このタブのID</label>
+          <input id="local-id" value="peer-a" autocomplete="off">
+        </div>
+        <div>
+          <label for="remote-id">相手タブのID</label>
+          <input id="remote-id" value="peer-b" autocomplete="off">
+        </div>
+      </div>
+      <label for="rtc-config">RTC設定 JSON（任意）</label>
+      <input id="rtc-config" value="{}" spellcheck="false">
+      <small>STUN/TURNは既定では設定されません。異なるNAT越しの接続には、利用側のICEサーバー設定が必要な場合があります。</small>
+      <div><button id="initialize">このタブを初期化</button></div>
+      <p class="status" id="status">未初期化</p>
+    </section>
+    <section>
+      <h2>2. サーバーなしでSDPを交換</h2>
+      <ol>
+        <li>片方のタブで「Offerを作成」し、Offerをもう片方へコピー。</li>
+        <li>受信側で相手IDを送信側IDに設定し、Offerを貼り「Offerを受け入れる」。</li>
+        <li>生成されたAnswerを送信側へコピーし、「Answerを適用」。</li>
+        <li>両タブの接続状態が <code>open</code> になったら、送信側でデータを配布する。</li>
+        <li>Object IDを受信側へコピーして回収する。</li>
+      </ol>
+      <label for="offer">Offer SDP</label>
+      <textarea id="offer" spellcheck="false"></textarea>
+      <button id="create-offer">Offerを作成</button>
+      <button id="accept-offer">Offerを受け入れてAnswerを作成</button>
+      <label for="answer">Answer SDP</label>
+      <textarea id="answer" spellcheck="false"></textarea>
+      <button id="apply-answer">Answerを適用</button>
+    </section>
+    <section>
+      <h2>3. データ送信・回収</h2>
+      <label for="payload">送信するUTF-8データ</label>
+      <textarea id="payload">NEXUS peer-to-peer packet circulation</textarea>
+      <label for="data-shards">復元に必要な片数</label>
+      <input id="data-shards" type="number" min="1" max="254" value="3">
+      <label for="parity-shards">冗長片数</label>
+      <input id="parity-shards" type="number" min="0" max="254" value="2">
+      <button id="publish">符号化してピアへ配布</button>
+      <label for="object-id">Object ID</label>
+      <input id="object-id" autocomplete="off">
+      <button id="retrieve">接続ピアから回収・復元</button>
+      <button id="sync">保存済みパケットを相手へ同期</button>
+      <p>回収結果: <span class="status" id="result">未実行</span></p>
+    </section>
+    <section>
+      <h2>状態・イベントログ</h2>
+      <p class="status" id="peer-status">ピア未接続</p>
+      <button id="refresh">状態更新</button>
+      <pre id="log" aria-live="polite"></pre>
+    </section>
+    <script type="module" src="./debug.js"></script>
+  </body>
+</html>
